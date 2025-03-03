@@ -1,0 +1,184 @@
+---
+title: 'Simulation: CSF'
+author: "Jessica Lavery"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  scenario: 52
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+
+library(tidyverse)
+library(gtsummary)
+library(grf)
+library(policytree)
+library(gt)
+library(survival)
+library(survminer)
+library(patchwork)
+
+set.seed(1123)
+
+# scenario to run report for
+scenario <- params$scenario
+
+# load analysis dataset
+load(here::here("data/project 1/application/analysis_df_nsclc_pdl1_positive.rdata"))
+
+# load simulated dataset
+load(here::here(paste0("data/Project 1/Simulation/Scenario ", scenario, "/scenario", scenario, "_sim_data_tte_with_confounder.rdata")))
+
+# formatting
+bstfun::theme_gtsummary_msk("lavery")
+theme_set(theme_bw() + theme(legend.position = "bottom"))
+```
+
+
+### Causal survival forest {.tabset .tabsetfade}
+
+```{r func_ate_ci}
+# function to get CI for ATE
+ate_ci <- function(csf_obj, digits = 2, text = "ATE, E[Y(1) - Y(0)]") {
+  paste0(
+    text, " ", round(csf_obj[1], digits),
+    " (95% CI ", round(csf_obj[1] - qnorm(0.975) * csf_obj[2], digits),
+    ", ", round(csf_obj[1] + qnorm(0.975) * csf_obj[2], digits), ")"
+  )
+}
+```
+
+#### target = survival.probability
+
+```{r}
+# first 500 iterations
+sim_data_tte500 <- sim_data_tte[1:500] %>% 
+  map(., ~mutate(.x,
+    prob_io_q03 = quantile(pred_io, 0.03),
+    pred_io_trim_lower_quantile = case_when(
+      pred_io < prob_io_q03 ~ prob_io_q03,
+      TRUE ~ pred_io
+    )
+  ))
+```
+
+
+```{r}
+# set up data for causal forest
+# run causal forest w/ tuning
+set.seed(1123) # seed here may not do anything
+
+l <- list(X = map(sim_data_tte500,
+                  ~as.matrix(.x %>% select(pdl1_perc_norm))), 
+          Y = map(sim_data_tte500, pull, outc_yrs), 
+          W = map(sim_data_tte500, 
+                  ~as.matrix(.x %>% select(tx))), 
+          D = map(sim_data_tte500, pull, status),
+          W.hat = map(sim_data_tte500, pull, pred_io_trim_lower_quantile) %>% #iptw_trim97
+            map(., as.numeric))
+
+# https://stackoverflow.com/questions/53874291/purrrpmap-with-other-default-inputs
+sim_csf <- pmap(l,
+                ~causal_survival_forest(X = ..1,
+                                        Y = ..2,
+                                        W = ..3,
+                                        D = ..4,
+                                        W.hat = ..5,
+                                        horizon = 1,
+                                        target = "survival.probability", 
+                                        # doesn't seem to do anything?
+                                        # applies to W-hat estimation, so if we are supplying W.hat, that's why it isn't doing anything
+                                        tune.parameters = "all", 
+                                        seed = 1123))
+```
+
+```{r}
+# variable importance
+sim_csf_var_imp <- map(sim_csf, variable_importance)
+
+# ATE
+sim_csf_ate <- map(sim_csf, ~ate_ci(average_treatment_effect(.x,
+                                target.sample = "all"),
+                                text = "ATE, E[Y(1) - Y(0)]"))
+
+# tau hats
+sim_csf_tau.hat <- map(sim_csf, pluck, "predictions")
+
+# get median within each iteration
+tau.hat.median <- map(sim_csf_tau.hat, median)
+
+# flag if greater than median
+high_effect <- map2(
+  sim_csf_tau.hat, tau.hat.median,
+  ~ .x > .y
+)
+
+# calculate ATE among above and below median
+ate.high <- map2(
+  sim_csf, high_effect,
+  ~ average_treatment_effect(.x, subset = .y)
+)
+
+ate.low <- map2(
+  sim_csf, high_effect,
+  ~ average_treatment_effect(.x, subset = !.y)
+)
+
+# estimate heterogeneity based on the difference in the ATE
+est_heterogeneity <- map2_df(
+  ate.high, ate.low,
+  ~ .x - .y
+) %>%
+  select(-std.err)
+
+# double robust scores
+sim_csf_dr_scores <- map(sim_csf, double_robust_scores)
+
+# policy tree
+sim_csf_policy_tree <- map(sim_data_tte500, select, pdl1_perc_norm) %>% 
+  map2(., sim_csf_dr_scores, ~policy_tree(X = .x, .y, depth = 1))
+
+# run best linear prediction
+best_linear_pred_tbl <- map2(
+  sim_csf, sim_data_tte500,
+  ~ best_linear_projection(.x, .y %>%
+    select(pdl1_perc_norm))
+) %>%
+  map(., broom::tidy, conf.int = TRUE) %>%
+  map(., ~ mutate(.x, across(
+    .cols = c(estimate, std.error, statistic, p.value),
+    .fns = ~ round(.x, 2)
+  ))) %>%
+  bind_rows()
+
+# observed Y-hats
+sim_csf_y_orig <- map(sim_csf, pluck, "Y.orig") %>% 
+  map_df(., as_tibble, .id = "iter") %>% 
+  rename(y_orig = value)
+
+# predicted Y-hats
+sim_csf_y_hats <- map(sim_csf, pluck, "Y.hat") %>% 
+  map_df(., as_tibble, .id = "iter") %>% 
+  rename(yhat = value)
+
+# predictions
+sim_csf_predictions <- map(sim_csf, pluck, "predictions") %>% 
+  map_df(., as_tibble, .id = "iter") %>% 
+  rename(predictions = V1)
+```
+
+```{r}
+# save CSF results
+save(sim_csf,  # made file SO large to load
+     file = here::here(paste0("data/Project 1/Simulation/Scenario ", scenario, "/sim_data_tte_csf_models_fix_what.rdata")))
+
+save(#sim_csf,  # made file SO large to load
+  sim_csf_y_orig, sim_csf_y_hats, sim_csf_predictions, 
+  sim_csf_tau.hat, est_heterogeneity, ate.high, ate.low,
+     sim_csf_var_imp, sim_csf_ate, 
+     sim_csf_dr_scores, sim_csf_policy_tree,
+  best_linear_pred_tbl,
+     file = here::here(paste0("data/Project 1/Simulation/Scenario ", scenario, "/sim_data_tte_csf_results_fix_what.rdata")))
+```

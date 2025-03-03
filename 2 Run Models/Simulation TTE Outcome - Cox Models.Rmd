@@ -1,0 +1,75 @@
+---
+title: "Simulation: Cox Models"
+author: "Jessica Lavery"
+date: "`r Sys.Date()`"
+params:
+    scenario: 132
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(tidyverse)
+library(gtsummary)
+library(survival)
+library(survminer)
+
+set.seed(1123)
+
+# scenario to run report for
+scenario <- params$scenario
+```
+
+```{r}
+# load simulated dataset
+load(here::here(paste0("data/Project 1/Simulation/Scenario ", scenario, "/scenario", scenario, "_sim_data_tte_with_confounder.rdata")))
+```
+
+```{r, sim_params}
+# df of simulation parameters
+sim_params <- readxl::read_excel(here::here("data/Project 1/Simulation/simulation_scenarios.xlsx")) %>% 
+  janitor::clean_names() %>% 
+  rename(scenario_var = scenario) %>% 
+  filter(scenario_var == scenario) 
+```
+
+### Cox Model: First 500 Iterations
+
+```{r}
+# first 500 iterations
+sim_data_tte500 <- sim_data_tte[1:500]
+```
+
+KM curve of a single iteration
+
+```{r}
+# km plot of raw data for one scenario
+ggsurvplot(fit = survfit(Surv(outc_yrs, status) ~ latent_subgroup + tx,
+           data = sim_data_tte500[[1]]),
+           data = sim_data_tte500[[1]],
+           linetype = "tx",
+           color = "latent_subgroup"
+           ) 
+```
+
+* Interaction of interest: covariate by treatment
+
+```{r}
+# cox model
+mod_cox <- map(sim_data_tte500,
+               ~coxph(Surv(outc_yrs, status) ~ pdl1_perc_norm*tx,
+      data = .x, 
+      weights = iptw_trim97))
+```
+
+```{r}
+# save with simulation number in the dataset name
+assign(paste0("mod_cox_scenario_", scenario), mod_cox)
+```
+
+```{r}
+# save Cox model results
+save(list = ls(pattern = "mod_cox_scenario"),
+     file = here::here(paste0("data/Project 1/Simulation/Scenario ", scenario, "/scenario_", scenario, "_sim_data_tte_cox_results.rdata")))
+```
